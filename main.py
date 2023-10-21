@@ -7,9 +7,19 @@ import itertools as it
 import operator as op
 
 import cairo
+import colour
 import more_itertools as mit
 import numpy as np
-from attractors import clifford_attractor
+from attractors import *
+
+
+def read_gpl(file):
+    lines = file.readlines()
+    lines = [line for line in lines if "\t" in line]
+    lines = ["#" + line.split()[-1] for line in lines]
+    lines = list(map(colour.hex2rgb, lines))
+
+    return np.array(lines)
 
 
 def sample_unit_disc(n_points, radius=1):
@@ -43,7 +53,6 @@ def sample_unit_circle(num_points):
     return points
 
 
-# @fscache.fscache(".cache", (lambda initial, func, n_iterations: [initial, func.__name__, n_iterations]))
 def iterate(initial, func, n_iterations=100):
     # Iterate the function some bounded number of times.
     series = mit.iterate(func, initial)
@@ -93,68 +102,119 @@ def lerp(a, b, t):
     return (b - a) * t + a
 
 
+def distance_to_closest_neighbor_high_memory_usage(a):
+    dist = (a[:, None, :] - a[None, :, :]).astype("float")
+    dist = np.sum(dist**2, axis=-1)
+    np.fill_diagonal(dist, "inf")
+    closest_dists = np.min(dist, axis=1) ** 0.5
+    return closest_dists
+
+
+def distance_to_closest_neighbor(a):
+    out = []
+    chunk_size = 300
+    i = 0
+
+    while i * chunk_size < len(a):
+        dist = a[:, None, :] - a[i * chunk_size : (i + 1) * chunk_size, :]
+        dist = np.sum(dist**2, axis=-1)
+
+        # incorrect  - dodges 0s but also often accidentally drops other points
+        o = np.partition(dist, 1, axis=1)[:, 1]
+        out.extend(o)
+        i += 1
+
+    return np.array(out)
+
+
 @dc.dataclass
 class AttractorPlotter:
     attractor: callable
     data: np.array = None
     context: cairo.Context = None
 
-    n_samples: int = 10_000
-    n_iterations: int = 100
-    n_skip_iterations: int = 5
+    n_samples: int = 415_000
+    n_iterations: int = 12
+    n_skip_iterations: int = 1
+
+    background_color: list = (0, 0, 0.02)
+
+    scale: float = 1
+    size: int = 4000
+    style: str = "dynamic-width"
+    palette: list = None
+
+    _palette_lookup_table: None = None
+
+    def make_lookup_table(self, n=100):
+        items = self.palette
+        out = []
+
+        for i in range(n):
+            frac = (i / n) * len(items)
+            idx = int(frac)
+
+            if (idx + 1) >= len(items):
+                break
+
+            out.append(lerp(items[idx], items[idx + 1], frac - idx))
+
+        self._palette_lookup_table = out[::-1]
 
     @property
     def n_points(self):
         return self.n_samples * (self.n_iterations - self.n_skip_iterations)
 
     def render_to(self, path):
-        # Randomly sample a ton of points and then use them?
-        samples = sample_unit_disc(self.n_samples)
-        points = iterate(samples, self.attractor, self.n_iterations)
-
+        self.make_lookup_table()
         print(f"Rendering attractor to {path} with {self.n_points} points...")
+
+        # Randomly sample points, iterate them, and ignore the first few (not rigorous)
+        # to only gain items within the attractor. This is done to exploit the vectorization
+        # of the functions - the iteration obviously requires the previous value to be
+        # known, so this allows some form of pararellism.
+        samples = sample_unit_disc(self.n_samples).astype(np.float16)
+        points = iterate(samples, self.attractor, self.n_iterations)
+        points = points[:, self.n_skip_iterations :, :]
+
+        # points = np.reshape(points, (-1, 2))
+        # points = [points]
 
         with self.rendering_to(path):
             for seq in points:
-                self.drawseq(seq[self.n_skip_iterations :])
+                self.drawseq(seq)
 
     @ctx.contextmanager
     def rendering_to(self, output_file):
         # Create a new surface and context
-        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, width, height)
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, self.size, self.size)
         context = cairo.Context(surface)
 
-        # Scale the coordinate system
-        context.scale(width / 2, height / 2)
+        # Scale the coordinate system.
+        context.scale(self.size / 2, self.size / 2)
         context.set_line_width(0.01)
 
-        # Translate the coordinate system so (0, 0) is at the center
+        # Translate the coordinate system so (0, 0) is at the center.
         context.translate(1, 1)
 
-        # Set background color
-        context.set_source_rgb(*background_color)
+        # Set background color.
+        context.set_source_rgb(*self.background_color)
         context.rectangle(-1, -1, 2, 2)
         context.fill()
 
-        # Scale down a little to make the unit circle not take up all the space
-        context.scale(0.3, 0.3)
-
-        context.set_source_rgba(*circle_color)
-        context.arc(0, 0, 1.5, 0, 2 * np.pi)
-        context.fill()
+        # Scale down a little to make the unit circle not take up all the space.
+        context.scale(0.4, 0.4)
+        context.scale(self.scale, self.scale)
 
         self.context = context
         yield
 
         # Save to PNG
         surface.write_to_png(output_file)
-        print(f"Image saved to {output_file}")
+        print(f"Image saved to {output_file}.")
         self.context = None
 
     def drawseq(self, points):
-        c0 = np.array([0.9, 0.9, 0.85])
-        c1 = np.array([0.9, 0.13, 0.1])
-
         length_diffs = np.diff(points, axis=0)
         length_diffs = np.linalg.norm(length_diffs, axis=1)
 
@@ -165,48 +225,55 @@ class AttractorPlotter:
 
         # The arc width scales with the square of the number of points,
         # since the square of the width is proportional to the area covered.
-        arc_width_scale = 3
-        arc_width = arc_width_scale / np.sqrt(self.n_points)
+        point_radius_scale = 2
+        point_radius = point_radius_scale / np.sqrt(self.n_points)
         alpha = 0.3
+
+        alpha_scaling = 0.12
+
+        resolution = len(self._palette_lookup_table) - 1
+
+        if self.style == "dynamic-width":
+            # Note that these distances are only an approximation
+            # based on the current batch. The distances may vary a lot if multiple
+            # batches are used.
+            distances = distance_to_closest_neighbor(points)
+            maxlen = np.max(distances)
+            maxlen = maxlen if maxlen != 0 else 1
+
+            distances /= maxlen
+
+            alphas = alpha / distances
+            alphas = np.clip(alphas, 0, 1)
 
         # Draw the line with color gradient
         for i in range(len(points) - 1):
-            x1, y1 = points[i]
-            x2, y2 = points[i + 1]
+            color = self._palette_lookup_table[int(resolution * length_diffs[i])]
 
-            # optimize: use a LUT instead
-            color = lerp(c0, c1, length_diffs[i])
+            if self.style == "lines":
+                self.context.set_source_rgba(*color, 0.1)
+                self.context.move_to(*points[i])
+                self.context.line_to(*points[i + 1])
+                self.context.stroke()
 
-            # # Uncomment to use lines:
-            # context.set_source_rgba(*color, 0.1)
-            # context.move_to(*points[i])
-            # context.line_to(*points[i + 1])
-            # context.line_to(*lerp(points[i], points[i + 1], 0.1))
-            # context.stroke()
+            elif self.style == "fixed-width":
+                self.context.set_source_rgba(*color, 1)
+                self.context.arc(*points[i], 0.02, 0, 2 * np.pi)
 
-            self.context.set_source_rgba(*color, alpha)
-            self.context.arc(*points[i], arc_width, 0, 2 * np.pi)
-            self.context.fill()
+            elif self.style == "dynamic-width":
+                if distances[i] == 0:
+                    continue
 
+                # color = self._palette_lookup_table[int(distances[i] * len(self._palette_lookup_table) * 0.99)]
+                opacity = alphas[i] * alpha_scaling
+                self.context.set_source_rgba(*color, opacity)
 
-# ===| Previously test module |===
+                # Render full:
+                # radius = (point_radius * (0.2**-0.8)) * 4
 
+                radius = (point_radius * (alphas[i] ** -0.8)) * 2
+                self.context.arc(*points[i], radius, 0, 2 * np.pi)
+                self.context.fill()
 
-# Image parameters
-width, height = 4000, 4000
-output_file = "output.png"
-
-# Colors
-background_color = (0, 0, 0)  # Black background
-circle_color = (0, 0.02, 0.03)  # Semi-transparent black
-
-
-def main():
-    np.random.seed(0)
-    # attractor = clifford_attractor(-1.7, 1.3, -0.1, -1.21)
-    attractor = clifford_attractor(-1.7, -1.3, -0.1, -1.21)
-    AttractorPlotter(attractor).render_to("results/clifford_0.png")
-
-
-if __name__ == "__main__":
-    main()
+            else:
+                raise NotImplementedError()

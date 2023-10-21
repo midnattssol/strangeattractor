@@ -2,3 +2,6 @@
 .cache
 .ropeproject
 __pycache__
+ignore
+results/*
+palettes
